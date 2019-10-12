@@ -16,6 +16,10 @@ import time
 import json
 import os.path
 
+# 增加kafka依赖
+from kafka import KafkaProducer
+from kafka.errors import KafkaError
+
 
 logging.getLogger().setLevel(logging.INFO)
 ch = logging.StreamHandler(sys.stdout)
@@ -40,7 +44,10 @@ parser.add_argument("--file", "-o", type=str, dest="output_file",
                     help="collector export JSON file")
 parser.add_argument("--debug", "-D", action="store_true",
                     help="Enable debug output")
-
+parser.add_argument("--topic", "-t", type=str, default='netflow',
+                    help="target kafka topic")
+parser.add_argument("--kafkasrv", "-k",type=str, default='',
+                    help="kafka server address")
 
 class SoftflowUDPHandler(socketserver.BaseRequestHandler):
     # We need to save the templates our NetFlow device
@@ -53,18 +60,28 @@ class SoftflowUDPHandler(socketserver.BaseRequestHandler):
     def set_output_file(cls, path):
         cls.output_file = path
 
+    @classmethod
+    def setKafkaProducer(cls, producer):
+        cls.kafka_producer = producer
+
+    @classmethod
+    def setKafkaTopic(cls, topic):
+        cls.topic = topic
+
     def handle(self):
-        if not os.path.exists(self.output_file):
-            with open(self.output_file, 'w') as fh:
-                json.dump({}, fh)
+        # if not os.path.exists(self.output_file):
+        #     with open(self.output_file, 'w') as fh:
+        #         json.dump({}, fh)
 
-        with open(self.output_file, 'r') as fh:
-            try:
-                existing_data = json.load(fh)
-            except json.decoder.JSONDecodeError as ex:
-                logging.error("Malformed JSON output file. Cannot read existing data, aborting.")
-                return
+        # with open(self.output_file, 'r') as fh:
+        #     try:
+        #         existing_data = json.load(fh)
+        #     except json.decoder.JSONDecodeError as ex:
+        #         logging.error("Malformed JSON output file. Cannot read existing data, aborting.")
+        #         return
 
+        existing_data = {}
+        
         data = self.request[0]
         host = self.client_address[0]
         logging.debug("Received data from {}, length {}".format(host, len(data)))
@@ -110,9 +127,11 @@ class SoftflowUDPHandler(socketserver.BaseRequestHandler):
         # Append new flows
         existing_data[time.time()] = [flow.data for flow in export.flows]
 
-        with open(self.output_file, 'w') as fh:
-            json.dump(existing_data, fh)
+        # 不需要每次全量重写， 只需要增加本次的即可，每次的数据写入kafka
+        # with open(self.output_file, 'w') as fh:
+        #     json.dump(existing_data, fh)
 
+        self.kafka_producer.send(self.topic, json.dumps(existing_data).encode())
 
 
 if __name__ == "__main__":
@@ -126,9 +145,20 @@ if __name__ == "__main__":
 
     host = args.host
     port = args.port
+
+    # 设置topic
+    kafka_topic = args.topic
+    SoftflowUDPHandler.setKafkaTopic(kafka_topic)
+
+    # 设置kafka producer
+    kafka_seradd = args.kafkasrv
+    producer = KafkaProducer(bootstrap_servers=kafka_seradd)
+
+    SoftflowUDPHandler.setKafkaProducer(producer)
+
     logging.info("Listening on interface {}:{}".format(host, port))
     server = socketserver.UDPServer((host, port), SoftflowUDPHandler)
-
+    
     try:
         logging.debug("Starting the NetFlow listener")
         server.serve_forever(poll_interval=0.5)
@@ -137,4 +167,5 @@ if __name__ == "__main__":
     except KeyboardInterrupt:
         raise
 
+    producer.close()
     server.server_close()
